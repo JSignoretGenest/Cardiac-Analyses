@@ -1,4 +1,4 @@
-classdef ECG_Process_v2 < handle
+classdef ECG_Process < handle
     %% ECG_Process - GUI to process ECG to extract heart rate.
     % Consists in three main steps:
     %   - ECG preprocessing: substraction of a smoothed version of the
@@ -7,8 +7,8 @@ classdef ECG_Process_v2 < handle
     %   - Manual verification in the GUI
     %
     %   Results and parameters used for the analysis are saved in a .mat
-    %   file in the same folder, and with _HeartBeats added to the original
-    %   file name.
+    %   file in the same folder (and optionally as a .csv),
+    %   with _HeartBeats added to the original file name.
     %
     %   NB: loading such file allows to modify the previously saved results
     %
@@ -16,29 +16,28 @@ classdef ECG_Process_v2 < handle
     %   allows to easily adjust them. Beats correction is easy, via simple
     %   clicking.
     %
+    %   Default parameters are different depending on the species.
+    %   The species can be specified in the call    
+    %       e.g. ECG_Process('Rat')
+    %   or changed in the default parameters of the class, then just
+    %   calling as ECG_Process
+    %   
     %   NB: supported formats are so far normal text files, matlab files,
-    %   .eeg files, Plexon and TDT tanks. 
+    %   .eeg files, Plexon, NeuraLynx(ncs) and TDT tanks. 
     %
+    %   NOTE: the signals are decimated to 1KHz for processing, so the
+    %   apparent loss of resolution is normal. The final time stamps are
+    %   reevaluated with the full sampling rate.
     %
     % Future implementations/changes:
-    %       - better documentation
-    %       - create different sets of default parameters for the different
-    %       conditions
-    %       - implement and refine the algorithm in this version of the
-    %       tool
-    %       - autoscale ignoring the artefacts segments
-    %       - shaded area on the heart rate to show the "abnormal" zone due
-    %       to the sliding windows overlaping with the margins of excluded
-    %       segments
     %       - tool showing suspicious ranges to be manually checked
-    %       - option to manually validate a few beats to give a good start
-    %       to the algorithm if needed
-    %       - optimize (some operations are slowing down the process and
-    %       could be restricted to sub-pieces of the signal to speed-up)
+    %       - optimization (some operations are slowing down the process 
+    %       and could be restricted to subpieces of the signal to speed-up)
+    %       - revamping of the metaparameters saving system (e.g. .yaml)
     %
-    %     Copyright (C) 2019 Jérémy Signoret-Genest, DefenseCircuitsLab
+    %     Copyright (C) 2024 JÃ©rÃ©my Signoret-Genest, DefenseCircuitsLab
     %     Original version: 04/12/2019
-    %     Current version: 23/08/2023
+    %     Current version: 13/10/2024
     %
     %
     %     This program is free software: you can redistribute it and/or modify
@@ -61,7 +60,7 @@ classdef ECG_Process_v2 < handle
     % List of properties to be adjusted depending on the experiments/setup
     properties(SetAccess = private, GetAccess = public, Hidden = false)
         PowerGrid = 50; % Frequency of the main hum (e.g. 50Hz for Europe, 60Hz for US)
-        Species = 'Mouse'; % 'Mouse' or 'Human'
+        Species = 'Mouse'; % Default species: 'Mouse', 'Rat' or 'Human'
     end
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%   
@@ -77,10 +76,13 @@ classdef ECG_Process_v2 < handle
         Scaling
 
         % Interactivity
-        Extensions = {'pl2','csv','eeg','txt','mat','tev'};
-        ExtensionFilter = '*.pl2;*.csv;*.eeg;*.txt;*.mat;*_Denoised.mat;*tev';
+        Extensions = {'pl2','csv','eeg','txt','mat','tev','ncs'};
+        ExtensionFilter = '*.pl2;*.csv;*.eeg;*.txt;*.mat;*_Denoised.mat;*tev;*.ncs';
 
         % Files
+        Basename
+        Ext
+        Path
         HeartBeatsFile
         LogFile
         RawFile
@@ -92,6 +94,7 @@ classdef ECG_Process_v2 < handle
         HeartBeats
         HeartRate
         MaxCorr
+        MaxNaNRange = 0.005; % Maximum duration (in s) of NaN ranges to be interpolated
         Parameters
         Peaks
         Preprocessed
@@ -134,15 +137,54 @@ classdef ECG_Process_v2 < handle
         Selected
         Scrolling = false;
         Slider
+
+        CurrVer = 240924;
+        LegacyMode = false;
     end
 
 
     methods
         % Constructor
-        function obj = ECG_Process_v2
+        function obj = ECG_Process(varargin)
             obj.Colors = DefColors;
             %% Parameters sets (valid for our acquisition systems, can be tuned differently)
+            obj.Parameters.Default.Rat = struct(...
+                'ArtefactsDetectSmoothing',26,...
+                'AutoUpdate',true,...
+                'AutoArtefactsRemoval',true,...
+                'BeatPeaksEnable', false,...
+                'BeatPeaksFilter', true,...
+                'BPEnable',true,...
+                'BPHigh', 400,...
+                'BPLow', 60,...
+                'Channel',[],...
+                'DeDriftEnable',0,...
+                'DeDriftKernel', 1,...
+                'Discontinue', 1,...
+                'ExportCSVHeartbeats',false,...
+                'ExportCSVHR',false,...
+                'ncs_ExternalFrag',false,...
+                'InverseECG',false,...
+                'NotchFilter', false,...
+                'Outlier', 50,...
+                'PassNumber',2,...
+                'Power', 4,...
+                'PeakRange', 8,...
+                'ProcessingSamplingRate',1000,... % Target sampling rate for the ECG during the analyses (downsampled to speed up and homogenize parameters)
+                'ShapesEnable', false,...
+                'SlidingWindowSize', 1,...
+                'SmoothDetection', 5,...
+                'Species','Rat',...
+                'StableIndex', 8,...
+                'SuspiciousFrequencyHigh', 12,...
+                'SuspiciousFrequencyLow', 6,...
+                'Threshold', 1e5,...
+                'Unit','bpm',...
+                'WaveformWindowLow', -20,...
+                'WaveformWindowHigh', 20);
+
             obj.Parameters.Default.Mouse = struct(...
+                'ArtefactsDetectSmoothing',16,...
                 'AutoUpdate',true,...
                 'AutoArtefactsRemoval',true,...
                 'BeatPeaksEnable', false,...
@@ -156,12 +198,14 @@ classdef ECG_Process_v2 < handle
                 'Discontinue', 1,...
                 'ExportCSVHeartbeats',false,...
                 'ExportCSVHR',false,...
+                'ncs_ExternalFrag',false,...
+                'InverseECG',false,...
                 'NotchFilter', false,...
                 'Outlier', 30,...
                 'PassNumber',2,...
                 'Power', 4,...
                 'PeakRange', 4,...
-                'ProcessingSamplingRate',1000,... % Target sampling rate for the ECG during the analyses (downsampled to speed up)
+                'ProcessingSamplingRate',1000,... % Target sampling rate for the ECG during the analyses (downsampled to speed up and homogenize parameters)
                 'ShapesEnable', false,...
                 'SlidingWindowSize', 0.6,...
                 'SmoothDetection', 3,...
@@ -176,6 +220,7 @@ classdef ECG_Process_v2 < handle
 
 
             obj.Parameters.Default.Human = struct(...
+                'ArtefactsDetectSmoothing',180,...
                 'AutoUpdate',true,...
                 'AutoArtefactsRemoval',true,...
                 'BeatPeaksEnable', false,...
@@ -189,26 +234,40 @@ classdef ECG_Process_v2 < handle
                 'Discontinue',4,...
                 'ExportCSVHeartbeats',false,...
                 'ExportCSVHR',false,...
+                'ncs_ExternalFrag',false,...
+                'InverseECG',false,...
                 'NotchFilter', true,...
                 'Outlier', 240,...
                 'PassNumber',2,...
                 'ProcessingSamplingRate',1000,...
                 'Power', 4,...
-                'PeakRange', 20,...
+                'PeakRange', 40,...
                 'ShapesEnable', false,...
                 'SlidingWindowSize', 5,...
-                'SmoothDetection', 20,...
+                'SmoothDetection', 35,...
                 'Species','Human',...
                 'StableIndex', 50,...
                 'SuspiciousFrequencyHigh', 2,...
                 'SuspiciousFrequencyLow', 1,...
                 'Threshold', 1e36,...
                 'Unit','bpm',...
-                'WaveformWindowLow', -150 ,...
-                'WaveformWindowHigh', 250);
+                'WaveformWindowLow', -75 ,...
+                'WaveformWindowHigh', 75);
 
-            % Set to Mouse by default
-            obj.RestoreDefault('Mouse');
+            % Set species
+            Species = fieldnames(obj.Parameters.Default);
+            if ~isempty(varargin)
+                if ~(numel(varargin)==1 && (ischar(varargin{1}) || isstring(varargin{1})) && numel(varargin{1})==1 && any(strcmpi(Species,varargin{1})))
+                    Species = varargin{1};
+                else
+                    error(['The only input allowed for ECG_Process is a valid species: ' newline...
+                    '''' strjoin(Species, ''', ''') '''.']);
+                end
+            else
+                % Set to default
+                Species = obj.Species;
+            end
+            obj.RestoreDefault(Species);
 
             %% Make sure that the GUI has access to the SDKs
             currentFile = mfilename('fullpath');
@@ -353,7 +412,7 @@ classdef ECG_Process_v2 < handle
                 'Units', 'Normalized', ...
                 'Position', [0.73 0.145 0.12 0.03], ...
                 'BackgroundColor', 'w', ...
-                'Value', obj.Parameters.Current.BPEnable);
+                'Value', obj.Parameters.Current.DeDriftEnable);
             uicontrol('Style', 'text', ...
                 'String',  'Window (s)', ...
                 'FontSize', obj.Scaling*16, ...
@@ -370,7 +429,7 @@ classdef ECG_Process_v2 < handle
                 'FontWeight', 'bold', ...
                 'Callback', {@(~,~)obj.BPEnableCB}, ...
                 'Units', 'Normalized', ...
-                'Position', [0.75 0.095 0.12 0.03], ...
+                'Position', [0.75 0.105 0.12 0.03], ...
                 'BackgroundColor', 'w', ...
                 'Value', obj.Parameters.Current.BPEnable);
             uicontrol('Style', 'text', ...
@@ -391,15 +450,6 @@ classdef ECG_Process_v2 < handle
                 'Position', [0.87 0.075 0.04 0.03], ...
                 'HorizontalAlignment', 'left', ...
                 'BackgroundColor', 'w');
-            obj.Handles.DeDriftKernel.Edit = uicontrol('Style', 'edit', ...
-                'String', obj.Parameters.Current.DeDriftKernel, ...
-                'FontSize', obj.Scaling*16, ...
-                'FontName', 'Arial', ...
-                'FontWeight', 'bold', ...
-                'Callback', {@(~,~)obj.DeDriftKernelEditCB}, ...
-                'Units', 'Normalized', ...
-                'Position', [0.9 0.145 0.04 0.03], ...
-                'HorizontalAlignment', 'center');
             obj.Handles.BPHigh.Edit = uicontrol('Style', 'edit', ...
                 'String', obj.Parameters.Current.BPHigh, ...
                 'FontSize', obj.Scaling*16, ...
@@ -417,6 +467,25 @@ classdef ECG_Process_v2 < handle
                 'Callback', {@(~,~)obj.BPLowEditCB}, ...
                 'Units', 'Normalized', ...
                 'Position', [0.9 0.11 0.04 0.03], ...
+                'HorizontalAlignment', 'center');
+            obj.Handles.InverseECG_CheckBox = uicontrol('Style', 'checkbox', ...
+                'String', ' Flip signal', ...
+                'FontSize', obj.Scaling*16, ...
+                'FontName', 'Arial', ...
+                'FontWeight', 'bold', ...
+                'Callback', {@(~,~)obj.InverseECGCB}, ...
+                'Units', 'Normalized', ...
+                'Position', [0.73 0.075 0.12 0.03], ...
+                'BackgroundColor', 'w', ...
+                'Value', obj.Parameters.Current.InverseECG);
+            obj.Handles.DeDriftKernel.Edit = uicontrol('Style', 'edit', ...
+                'String', obj.Parameters.Current.DeDriftKernel, ...
+                'FontSize', obj.Scaling*16, ...
+                'FontName', 'Arial', ...
+                'FontWeight', 'bold', ...
+                'Callback', {@(~,~)obj.DeDriftKernelEditCB}, ...
+                'Units', 'Normalized', ...
+                'Position', [0.9 0.145 0.04 0.03], ...
                 'HorizontalAlignment', 'center');
             % NB: all the "Set" buttons are in theory useless, but since
             % the callbacks for the edit boxes are executed only when
@@ -1030,12 +1099,28 @@ classdef ECG_Process_v2 < handle
                 else
                     % Read the file to find the raw ECG file name / type
                     Loaded_LogFile = load(TempLogFile);
-                    TempRawFile = Loaded_LogFile.Files.RawECG_File;
-                    Ext = Loaded_LogFile.Files.RawECG_FileType;
-                    % Legacy
-                    TestExt = strsplit(Ext,'.');
-                    if ~isempty(TestExt{1})
-                        Ext = ['.' TestExt{2}];
+                    if isfield(Loaded_LogFile,'Files')
+                        TempRawFile = Loaded_LogFile.Files.RawECG_File;
+                        Ext = [Loaded_LogFile.Files.RawECG_FileType];
+                    else
+                        % Legacy
+                        FileFound = false;
+                        for FileExt = 1 : numel(obj.Extensions)
+                            if ~strcmpi(obj.Extensions{FileExt},'mat')
+                                TempRawFile = fullfile(Path,[Basename '.' obj.Extensions{FileExt}]);
+                                Ext = ['.' obj.Extensions{FileExt}];
+                                if isfile(TempRawFile)
+                                    FileFound = true;
+                                    break
+                                end
+                            end
+                        end
+                        if ~FileFound
+                            Wn = warndlg(['No matching raw ECG file found for the session.' newline 'Aborting.']);
+                            waitfor(Wn)
+                            obj.EnableAll;
+                            return
+                        end
                     end
                     TempReloadMode = true;
                 end
@@ -1070,7 +1155,12 @@ classdef ECG_Process_v2 < handle
                     % Retrieve channels
                     if TempReloadMode
                         Loaded_LogFile = load(TempLogFile);
-                        ChanPlexon = Loaded_LogFile.Parameters.Channel;
+                        % Legacy
+                        if ~isfield(Loaded_LogFile.Parameters,'Current')
+                            ChanPlexon = Loaded_LogFile.Parameters.Channel;
+                        else
+                            ChanPlexon = Loaded_LogFile.Parameters.Current.Channel;
+                        end
                     else
                         Pl2_Index = PL2GetFileIndex(TempRawFile);
                         Analog_Index = arrayfun(@(x) (~(Pl2_Index.AnalogChannels{x}.NumValues == 0)) & strcmpi(Pl2_Index.AnalogChannels{x}.SourceName,'AI'),1:numel(Pl2_Index.AnalogChannels));
@@ -1103,7 +1193,95 @@ classdef ECG_Process_v2 < handle
                     TempRawFrequency = ECG.ADFreq;
                     TempRawTimes = ECG.FragTs + ((1 : ECG.FragCounts) / ECG.ADFreq);
                     Frag = ECG.FragTs;
+                case '.ncs'
+                    Frag = 0;
+                    % Optional: use event channel to realign data
+                    if ~isempty(obj.Parameters.Current.ncs_ExternalFrag)
+                        % Try to find an event file with a similar basename
+                        Split_Basename = strsplit(Basename,'_');
+                        EventsFile = [Path filesep strjoin(['Events', Split_Basename(2:end)],'_'),'.nev'];
+                        if isfile(EventsFile)
+                            [Timestamps_tmp,~,Eventstrings_tmp] = Nlx2MatEV(EventsFile,[1 0 1 0 1],0,1,0);
+                            % Use custom events to fetch longest recording
+                            % in case of multiple bouts
+                            StartIdx = find(contains(Eventstrings_tmp,'Starting Recording'));
+                            EndIdx = find(contains(Eventstrings_tmp,'Stopping Recording'));
+                            % Initialize arrays
+                            validStartIdx = [];
+                            validEndIdx = [];
+                            validDeltas = [];
 
+                            % Loop through all StartIdx and EndIdx
+                            for i = 1:length(StartIdx)
+                                for j = 1:length(EndIdx)
+                                    % Only consider pairs where EndIdx is after StartIdx
+                                    if EndIdx(j) > StartIdx(i)
+                                        % Store the valid start and end indices
+                                        validStartIdx = [validStartIdx, StartIdx(i)];
+                                        validEndIdx = [validEndIdx, EndIdx(j)];
+                                        % Calculate the delta (duration of the recording)
+                                        validDeltas = [validDeltas, EndIdx(j) - StartIdx(i)];
+                                    end
+                                end
+                            end
+                            % Now find the maximum delta (longest recording session)
+                            [~, MaxIdx] = max(validDeltas);
+                            % Extract the corresponding start and end indices for the longest session
+                            RecordingStartIdx = validStartIdx(MaxIdx);
+                            RecordingEndIdx = validEndIdx(MaxIdx);
+                            % Trim the data to the longest valid session
+                            AbsTimeRange = Timestamps_tmp([RecordingStartIdx,RecordingEndIdx]);
+                        end
+                    else
+                        AbsTimeRange = [];
+                    end
+                    % Load data
+                    [Timestamps, ~, SampleFrequencies, NumberOfValidSamples, Samples, ~] = Nlx2MatCSC(TempRawFile,ones(1,5),1,1,1);
+
+                    % Adjust ranges if needed
+                    if ~isempty(AbsTimeRange)
+                        TrimIndx = Timestamps>=AbsTimeRange(1) & Timestamps<=AbsTimeRange(2);
+                        Timestamps = Timestamps(TrimIndx);
+                        SampleFrequencies = SampleFrequencies(TrimIndx);
+                        NumberOfValidSamples = NumberOfValidSamples(TrimIndx);
+                        Samples = Samples(:,TrimIndx);
+                        Timestamps = (Timestamps-AbsTimeRange(1))/1e6;
+                    else
+                        Timestamps = (Timestamps-Timestamps(1))/1e6;
+                    end
+
+                    % Check frequencies
+                    TempRawFrequency = unique(SampleFrequencies);
+                    if numel(TempRawFrequency) ~= 1
+                        error('Several sampling frequencies found in the file.');
+                    end
+
+                    % Files are divided in blocks of N samples
+                    nSamplesPerBlock = size(Samples,1);
+                    Times_B = ((1:nSamplesPerBlock)/TempRawFrequency)';
+
+                    % Preallocate
+                    TempRawValues = nan(numel(Samples),1);
+                    TempRawTimes = nan(1,numel(Samples));
+
+                    % Loop to retrieve data
+                    FaultyBlocks = 0;
+                    Current_Indx = 0;
+                    for Block = 1 : size(Samples,2)
+                        if NumberOfValidSamples(Block)~=nSamplesPerBlock
+                            FaultyBlocks = FaultyBlocks+1;
+                            continue
+                        end
+                        Data_Block = Samples(1 : NumberOfValidSamples(Block),Block);
+                        Times_Block = Timestamps(Block) + Times_B(1 : NumberOfValidSamples(Block));
+                        TempRawValues(Current_Indx + (1 : NumberOfValidSamples(Block))) = Data_Block;
+                        TempRawTimes(Current_Indx + (1 : NumberOfValidSamples(Block))) = Times_Block;
+                        Current_Indx = Current_Indx + NumberOfValidSamples(Block)-1;
+                    end
+                    % Trim/remove NaNs
+                    NaNIndx = isnan(TempRawValues);
+                    TempRawValues = TempRawValues(~NaNIndx);
+                    TempRawTimes = TempRawTimes(~NaNIndx);
                 case '.tev'
                     % Retrieve channels
                     if TempReloadMode
@@ -1205,7 +1383,7 @@ classdef ECG_Process_v2 < handle
                         % "channels")
                         RawLoaded = load(TempRawFile);
                         ValidFile = false;
-                        if (isarray(RawLoaded) && all(isnumeric(RawLoaded),'all'))
+                        if (ismatrix(RawLoaded) && all(isnumeric(RawLoaded),'all'))
                             if (size(RawLoaded,2)>1 && size(RawLoaded,1)>=10) % At least 10 values to make sure we have the right orientation
                                 Time_diff = diff(RawLoaded(:,1));
                                 Tolerance = 1e-6;
@@ -1223,7 +1401,12 @@ classdef ECG_Process_v2 < handle
                         else
                             if TempReloadMode
                                 Loaded_LogFile = load(TempLogFile);
-                                Channel = Loaded_LogFile.Channel;
+                                % Legacy
+                                if ~isfield(Loaded_LogFile.Parameters,'Current')
+                                    Channel = Loaded_LogFile.Parameters.Channel;
+                                else
+                                    Channel = Loaded_LogFile.Parameters.Current.Channel;
+                                end
                             else
                                 if size(RawLoaded,2)>2
                                     [IndexChannel] = listdlg('PromptString','Select the ECG channel to use:',...
@@ -1246,62 +1429,200 @@ classdef ECG_Process_v2 < handle
                                     Channel = IndexChannel;
                                 end
                             end
-                            TempRawValues = RawLoaded.Values(:,Channel);
+                            TempRawValues = RawLoaded(:,Channel);
                             TempRawTimes = RawLoaded(:,1);
-                            TempRawFrequency = mean(diff(TempRawTimes));
+                            TempRawFrequency = 1/mean(diff(TempRawTimes));
                         end
+                    end
+                case '.log'
+                    try
+                        % Open the file
+                        fileID = fopen(TempRawFile, 'r');
+
+                        % Skip header lines until we reach the data section
+                        Valid = false;
+                        while true
+                            currentLine = fgetl(fileID);
+                            if contains(currentLine, {'ACQ_TIME_TICS', 'CHANNEL', 'VALUE'})
+                                Valid = true;
+                                break;
+                            end
+                        end
+                        if ~Valid
+                            Wn = warndlg(['The file does not contain a valid ECG signal as [ACQ_TIME_TICS, CHANNEL, VALUE].'...
+                                newline 'Aborting.']);
+                            waitfor(Wn)
+                            obj.EnableAll;
+                            return
+                        end
+                        % Read the data
+                        data = textscan(fileID, '%d %s %d %*s', 'Delimiter', ' ', 'MultipleDelimsAsOne', true);
+                        % Close the file
+                        fclose(fileID);
+                        % Create the table
+                        dataTable = table(data{:}, 'VariableNames', {'ACQ_TIME_TICS', 'CHANNEL', 'VALUE'});
+                        if TempReloadMode
+                            Loaded_LogFile = load(TempLogFile);
+                            % Legacy
+                            if ~isfield(Loaded_LogFile.Parameters,'Current')
+                                Channel = Loaded_LogFile.Parameters.Channel;
+                            else
+                                Channel = Loaded_LogFile.Parameters.Current.Channel;
+                            end
+                        else
+
+                            Channels_Strings = unique(dataTable.CHANNEL);
+                            if numel(Channels_Strings)>1
+                                [IndexChannel] = listdlg('PromptString','Select the ECG channel(s) to use:',...
+                                    'SelectionMode','multiple',...
+                                    'ListString',Channels_Strings);
+                                if numel(IndexChannel)>2 || numel(IndexChannel)<1
+                                    Wn = warndlg(['Can only select one or two (differential) channels.'...
+                                        newline 'Aborting.']);
+                                    waitfor(Wn)
+                                    obj.EnableAll;
+                                    return
+                                end
+                            else
+                                IndexChannel = 1;
+                            end
+                            if any(isnan(IndexChannel)) || isempty(IndexChannel)
+                                if isempty(obj.RawFile)
+                                    obj.Handles.Load.Enable = 'on';
+                                    obj.Handles.StartPath.Enable = 'on';
+                                    obj.Handles.Exit.Enable = 'on';
+                                else
+                                    obj.EnableAll;
+                                end
+                                return
+                            else
+                                Channel = Channels_Strings(IndexChannel);
+                            end
+                        end
+
+                        for Cn = 1 : numel(Channel)
+                            IndxC = strcmpi(dataTable.CHANNEL,Channel{Cn});
+                            TempRawValues{Cn} = dataTable.VALUE(IndxC);
+                            TempRawTimes{Cn} = (dataTable.ACQ_TIME_TICS(IndxC))';
+                            TempRawTimes{Cn} = double(TempRawTimes{Cn} - TempRawTimes{Cn}(1))/1000;
+                        end
+                        if numel(Channel)>1
+                            UnifiedTimes = unique(sort([TempRawTimes{:}]));
+                            % Preallocate with NaNs
+                            TempRawValues = NaN(numel(UnifiedTimes), numel(Channel));
+                            % Align values to the unified timeline
+                            for Cn = 1 : numel(Channel)
+                                CurrentTimes = TempRawTimes{Cn};
+                                CurrentValues = TempRawValues{Cn};
+                                [~, LocInUnified] = ismember(CurrentTimes, UnifiedTimes);
+                                TempRawValues(LocInUnified(LocInUnified > 0), Cn) = CurrentValues;
+                            end
+
+                            TempRawValues = diff(TempRawValues,[],2);
+                            TempRawTimes = UnifiedTimes';
+                        else
+                            TempRawValues = TempRawValues{1};
+                            TempRawTimes = (TempRawTimes{1})';
+                        end
+                       
+                        TempRawTimes = TempRawTimes';
+                        TempRawFrequency = 1/mean(diff(TempRawTimes));
+                        TempRawValues = obj.InterpNaN(TempRawValues,ceil(obj.MaxNaNRange*TempRawFrequency));
+                    catch
+                        Wn = warndlg(['The file does not contain a valid ECG signal as [ACQ_TIME_TICS, CHANNEL, VALUE].'...
+                            newline 'Aborting.']);
+                        waitfor(Wn)
+                        obj.EnableAll;
+                        return
                     end
                 case {'.txt','.csv'}
                     try
-                        RawLoaded = readtable(TempRawFile,'Delimiter',',');
-                        ValidFile = false;
-                        if (isarray(RawLoaded) && all(isnumeric(RawLoaded),'all'))
-                            if (size(RawLoaded,2)>1 && size(RawLoaded,1)>=10) % At least 10 values to make sure we have the right orientation
-                                Time_diff = diff(RawLoaded(:,1));
-                                Tolerance = 1e-6;
-                                if all(abs(Time_diff - mean(Time_diff)) < Tolerance) && all(Time_diff>0)
-                                    ValidFile = true;
-                                end
-                            end
-                        end
-                        if ~ValidFile
-                            Wn = warndlg(['The file does not contain a valid ECG signal as [TimeStamps, Channel1_Values,..., Channeln_Values].'...
-                                newline 'Aborting.']);
-                            waitfor(Wn)
-                            obj.EnableAll;
-                            return
-                        else
-                            if TempReloadMode
-                                Loaded_LogFile = load(TempLogFile);
-                                Channel = Loaded_LogFile.Channel;
+                        RawLoaded = readtable(TempRawFile);
+                        if TempReloadMode
+                            Loaded_LogFile = load(TempLogFile);
+                            % Legacy
+                            if ~isfield(Loaded_LogFile.Parameters,'Current')
+                                Channel = Loaded_LogFile.Parameters.Channel;
                             else
-                                if size(RawLoaded,2)>2
-                                    [IndexChannel] = listdlg('PromptString','Select the ECG channel to use:',...
-                                        'SelectionMode','single',...
-                                        'ListString',string(1:(size(RawLoaded,2)-1)));
-                                    IndexChannel = str2double(IndexChannel) + 1;
-                                else
-                                    IndexChannel = 2;
-                                end
-                                if isnan(IndexChannel) || isempty(IndexChannel)
-                                    if isempty(obj.RawFile)
-                                        obj.Handles.Load.Enable = 'on';
-                                        obj.Handles.StartPath.Enable = 'on';
-                                        obj.Handles.Exit.Enable = 'on';
-                                    else
-                                        obj.EnableAll;
-                                    end
-                                    return
-                                else
-                                    Channel = IndexChannel;
-                                end
+                                Channel = Loaded_LogFile.Parameters.Current.Channel;
                             end
-                            TempRawValues = RawLoaded.Values(:,Channel);
-                            TempRawTimes = RawLoaded(:,1);
-                            TempRawFrequency = mean(diff(TempRawTimes));
+                        else
+                            VarList = RawLoaded.Properties.VariableNames;
+                            Channels_Strings = VarList(contains(VarList,'ECG'));
+                            TimeVar_String = [];
+                            if any(contains(lower(VarList),'volume'))
+                                TimeVar_String = VarList(contains(lower(VarList),'volume'));
+                            else
+                                TimeVar_String = VarList(contains(lower(VarList),'time'));
+                            end
+                            Channels_Strings = VarList(contains(lower(VarList),'ecg'));
+                            if numel(TimeVar_String)~=1 || ~(numel(Channels_Strings)>=1)
+                                Wn = warndlg(['The file does not contain a valid ECG signal as [TimeStamps, Channel1_Values,..., Channeln_Values].'...
+                                    newline 'Aborting.']);
+                                waitfor(Wn)
+                                obj.EnableAll;
+                                return
+                            end
+                            if numel(Channels_Strings)>1
+                                [IndexChannel] = listdlg('PromptString','Select the ECG channel(s) to use:',...
+                                    'SelectionMode','multiple',...
+                                    'ListString',Channels_Strings);
+                                if numel(IndexChannel)>2 || numel(IndexChannel)<1
+                                    Wn = warndlg(['Can only select one or two (differential) channels.'...
+                                        newline 'Aborting.']);
+                                    waitfor(Wn)
+                                    obj.EnableAll;
+                                    return
+                                end
+                            else
+                                IndexChannel = 1;
+                            end
+                            if any(isnan(IndexChannel)) || isempty(IndexChannel)
+                                if isempty(obj.RawFile)
+                                    obj.Handles.Load.Enable = 'on';
+                                    obj.Handles.StartPath.Enable = 'on';
+                                    obj.Handles.Exit.Enable = 'on';
+                                else
+                                    obj.EnableAll;
+                                end
+                                return
+                            else
+                                Channel = Channels_Strings(IndexChannel);
+                            end
                         end
+                        for Cn = 1 : numel(Channel)
+                            TempRawValues_Cn = RawLoaded.(Channel{Cn});
+                            % Check types (we cannot know ahead, and we leave
+                            % the possibility to have extra columns)
+                            if ~isnumeric(TempRawValues_Cn)
+                                % Likely cells of strings
+                                cellArray = strrep(TempRawValues_Cn, ',', '.');
+                                joinedString = strjoin(cellArray, ' ');
+                                numericMatrix = sscanf(joinedString, '%f');
+                                numRows = length(TempRawValues_Cn);  % Number of rows in the original data
+                                TempRawValues_Cn = reshape(numericMatrix, 1, numRows)';
+                            end
+                            TempRawValues(:,Cn) = TempRawValues_Cn;
+                        end
+                        if numel(Channel)>1
+                            TempRawValues = diff(TempRawValues,[],2);
+                        end
+                        TempRawTimes = RawLoaded.(TimeVar_String{1});
+                        if ~isnumeric(TempRawTimes)
+                            % Likely cells of strings
+                            cellArray = strrep(TempRawTimes, ',', '.');
+                            joinedString = strjoin(cellArray, ' ');
+                            numericMatrix = sscanf(joinedString, '%f');
+                            numRows = length(TempRawTimes);  % Number of rows in the original data
+                            TempRawTimes = reshape(numericMatrix, 1, numRows)';
+                        end
+                        TempRawTimes = TempRawTimes';
+                        [TempRawTimes,IndxU] = unique(TempRawTimes);
+                        TempRawValues = TempRawValues(IndxU);
+                        TempRawFrequency = 1/mean(diff(TempRawTimes));
+                        TempRawValues = obj.InterpNaN(TempRawValues,ceil(obj.MaxNaNRange*TempRawFrequency));
                     catch
-                        Wn = warndlg(['The file does not contain a valid ECG signal as [TimeStamps, Channel1_Values,..., Channeln_Values].'...
+                        Wn = warndlg(['The file does not contain a valid ECG signal with one header containing ''time'' and headers containing ''ECGx''.'...
                             newline 'Aborting.']);
                         waitfor(Wn)
                         obj.EnableAll;
@@ -1311,7 +1632,7 @@ classdef ECG_Process_v2 < handle
             if TempReloadMode
                 % Get the beats times in memory
                 Loaded_HeartbeatsFile = load(TempHeartBeatsFile);
-                obj.HeartBeats = Loaded_HeartbeatsFile.HeartBeats;
+                obj.HeartBeats = round(Loaded_HeartbeatsFile.HeartBeats,6);
                 % Legacy/conversion
                 if size(obj.HeartBeats,1)>1
                     obj.HeartBeats = obj.HeartBeats';
@@ -1319,9 +1640,10 @@ classdef ECG_Process_v2 < handle
                 
                 obj.RemovedWindows = Loaded_HeartbeatsFile.RemovedWindows;
                
-                if isfield(Loaded_HeartbeatsFile,'BeatPeaks')
-                    obj.BeatPeaks = Loaded_HeartbeatsFile.BeatPeaks;
+                if isfield(Loaded_HeartbeatsFile,'BeatPeaks') && isfield(Loaded_HeartbeatsFile,'GUIver')
+                    obj.BeatPeaks = round(Loaded_HeartbeatsFile.BeatPeaks,6);
                 else
+                    obj.LegacyMode = true;
                     obj.BeatPeaks = [];
                 end
 
@@ -1332,10 +1654,20 @@ classdef ECG_Process_v2 < handle
                 % Reapply parameters
                 % Reattribute values one by one in case we change the
                 % structure at some point (to prevent any missing property)
-                Fields = fieldnames(Loaded_LogFile.Parameters.Current);
-                for F = 1 : numel(Fields)
-                    if isfield(obj.Parameters.Current,Fields{F})
-                        obj.Parameters.Current.(Fields{F}) = Loaded_LogFile.Parameters.Current.(Fields{F});
+                if isfield(Loaded_LogFile.Parameters,'Current')
+                    Fields = fieldnames(Loaded_LogFile.Parameters.Current);
+                    for F = 1 : numel(Fields)
+                        if isfield(obj.Parameters.Current,Fields{F})
+                            obj.Parameters.Current.(Fields{F}) = Loaded_LogFile.Parameters.Current.(Fields{F});
+                        end
+                    end
+                else
+                    Fields = fieldnames(Loaded_LogFile.Parameters);
+                    %Legacy
+                    for F = 1 : numel(Fields)
+                        if isfield(obj.Parameters,Fields{F})
+                            obj.Parameters.Current.(Fields{F}) = Loaded_LogFile.Parameters.(Fields{F});
+                        end
                     end
                 end
 
@@ -1358,6 +1690,9 @@ classdef ECG_Process_v2 < handle
                 obj.Handles.BeatPeaksEnable.Value = 1;
             end
 
+            obj.Path = Path;
+            obj.Basename = Basename;
+            obj.Ext = Ext;
             obj.Parameters.Current.Channel = Channel;
             obj.Parameters.Current.Frag = Frag;
             obj.ReloadMode = TempReloadMode;
@@ -1440,6 +1775,11 @@ classdef ECG_Process_v2 < handle
             obj.Parameters.Current.DeDriftEnable =  obj.Handles.DeDrift_CheckBox.Value;
             obj.Preprocess;
         end
+        
+        function InverseECGCB(obj)
+            obj.Parameters.Current.InverseECG =  obj.Handles.InverseECG_CheckBox.Value;
+            obj.Preprocess;
+        end
 
         function DeDriftKernelEditCB(obj)
             if str2double(obj.Handles.DeDriftKernel.Edit.String)>0
@@ -1512,6 +1852,7 @@ classdef ECG_Process_v2 < handle
         function WaveformWindowLowEditCB(obj)
             if str2double(obj.Handles.WaveformWindowLow.Edit.String)<obj.Parameters.Current.WaveformWindowHigh
                 obj.Parameters.Current.WaveformWindowLow = str2double(obj.Handles.WaveformWindowLow.Edit.String);
+                obj.Detect;
             else
                 obj.Handles.WaveformWindowLow.Edit.String = num2str(obj.Parameters.Current.WaveformWindowLow);
             end
@@ -1520,6 +1861,7 @@ classdef ECG_Process_v2 < handle
         function WaveformWindowHighEditCB(obj)
             if str2double(obj.Handles.WaveformWindowHigh.Edit.String)>obj.Parameters.Current.WaveformWindowLow
                 obj.Parameters.Current.WaveformWindowHigh = str2double(obj.Handles.WaveformWindowHigh.Edit.String);
+                obj.Detect;
             else
                 obj.Handles.WaveformWindowHigh.Edit.String = num2str(obj.Parameters.Current.WaveformWindowHigh);
             end
@@ -1606,7 +1948,7 @@ classdef ECG_Process_v2 < handle
         end
 
         function ExportCSVHRCB(obj)
-            if obj.Handles.ExportCSVHeartbeats.Value==0
+            if obj.Handles.ExportCSVHR==0
                 obj.Parameters.Current.ExportCSVHR = 0;
             else
                 obj.Parameters.Current.ExportCSVHR = 1;
@@ -1614,18 +1956,23 @@ classdef ECG_Process_v2 < handle
         end
 
         function EnableShapesCB(obj)
-            obj.DisableAll;
             if obj.Handles.EnableShapes.Value==0
                 obj.Parameters.Current.ShapesEnable = 0;
-                delete(obj.Handles.ShapesBeats);
             else
                 obj.Parameters.Current.ShapesEnable = 1;
+            end
+            obj.PlotBeatShapes;
+        end
 
-                % Instead of plotting individual waveforms, we'll just
-                % overlay full ECG traces again, with NaN ranges
-                % (much faster/efficient even when navigating
-                % afterwards)
-                [~,~,Indx] = intersect(obj.HeartBeats,obj.Peaks);
+        function PlotBeatShapes(obj)
+            obj.DisableAll;
+            delete(obj.Handles.ShapesBeats);
+            % Instead of plotting individual waveforms, we'll just
+            % overlay full ECG traces again, with NaN ranges
+            % (much faster/efficient even when navigating
+            % afterwards)
+            if obj.Parameters.Current.ShapesEnable
+                Indx = obj.Intersect(obj.HeartBeats,obj.Peaks);
                 [~,Indx2] = setdiff(obj.Peaks,obj.HeartBeats);
                 TempSignal1 = NaN(size(obj.Preprocessed));
                 TempSignal2 = NaN(size(obj.Preprocessed));
@@ -1637,36 +1984,32 @@ classdef ECG_Process_v2 < handle
                 TempSignal2(FullIndx2) = obj.Preprocessed(FullIndx2);
                 obj.Handles.ShapesBeats = [plot(obj.Times, TempSignal2,'Color',[0.8 0.8 0.8],'LineWidth',1.5,'Parent',obj.Axes.SubPeaks);
                     plot(obj.Times, TempSignal1,'Color',obj.Colors(2,:),'LineWidth',1.5,'Parent',obj.Axes.SubPeaks)];
-
-                delete(obj.Handles.MarkersBeats)
-                delete(obj.Handles.MarkersAll)
-                obj.Handles.MarkersAll = plot(obj.Peaks,zeros(size(obj.Peaks)),'d','Color',[0.6 0.6 0.6],'MarkerEdgeColor','k','ButtonDownFcn',@(~,~)obj.SelectBeat,'Parent',obj.Axes.SubPeaks,'MarkerSize',12,'MarkerFaceColor',[0.6 0.6 0.6]);
-                obj.Handles.MarkersBeats = plot(obj.HeartBeats,zeros(size(obj.HeartBeats)),'d','Color',obj.Colors(3,:),'MarkerEdgeColor','k','ButtonDownFcn',@(~,~)obj.SelectBeat,'Parent',obj.Axes.SubPeaks,'MarkerSize',12,'MarkerFaceColor',obj.Colors(3,:));
-                if obj.Parameters.Current.BeatPeaksEnable
-                    uistack(obj.Handles.BeatPeaks,'top');
-                end
+            else
+                obj.Handles.ShapesBeats = [];
             end
             obj.EnableAll;
         end
 
         function BeatPeaksEnableCB(obj)
-            obj.DisableAll;
             if obj.Handles.BeatPeaksEnable.Value==0
                 obj.Parameters.Current.BeatPeaksEnable = 0;
-                if isfield(obj.Handles,'BeatPeaks')
-                    delete(obj.Handles.BeatPeaks)
-                end
             else
                 obj.Parameters.Current.BeatPeaksEnable = 1;
-                [~,~,Indx] = intersect(obj.HeartBeats,obj.Peaks);
-                if isfield(obj.Handles,'BeatPeaks')
-                    delete(obj.Handles.BeatPeaks)
-                end                    
+            end
+                obj.PlotBeatPeaks;
+        end
+
+        function PlotBeatPeaks(obj)
+            obj.DisableAll;
+            delete(obj.Handles.BeatPeaks)
+            if obj.Parameters.Current.BeatPeaksEnable  
+                Indx = obj.Intersect(obj.HeartBeats,obj.Peaks);
                 obj.Handles.BeatPeaks = plot((obj.BeatPeaks(Indx,1))', (obj.BeatPeaks(Indx,2))','o','Color','k','MarkerSize',10,'LineWidth',1.5,'Parent',obj.Axes.SubPeaks);
+            else
+                obj.Handles.BeatPeaks = [];
             end
             obj.EnableAll;
         end
-
 
         function AutoUpdateHRCB(obj)
             if obj.Handles.AutoUpdateHR.Value==0
@@ -1678,7 +2021,7 @@ classdef ECG_Process_v2 < handle
 
         function SaveCB(obj)
             obj.DisableAll;
-            [~,~,Indx] = intersect(obj.HeartBeats,obj.Peaks);
+            Indx = obj.Intersect(obj.HeartBeats,obj.Peaks);
             BeatPeaks = obj.BeatPeaks(Indx,1);
             if obj.Frequency<obj.RawFrequency
                 % We need to rederive the peaks time with the full sampling
@@ -1686,28 +2029,37 @@ classdef ECG_Process_v2 < handle
                 % way, and keep only the validated peaks by using the very
                 % same index
 
-                % Remove drift (after scaling window size to real rate)
-                ECGDeDrift = obj.RawValues - smoothdata(obj.RawValues,'gaussian',round(obj.Parameters.Current.DeDriftKernel*obj.RawFrequency/obj.Frequency));
+                TempPreprocessed = obj.RawValues;
+                TempPreprocessed = TempPreprocessed-nanmean(TempPreprocessed);
 
-                % Filter
+                % Flipping signal
+                if obj.Parameters.Current.InverseECG
+                    TempPreprocessed = -TempPreprocessed;
+                end
+
+                % Remove drift by using sliding average
+                if obj.Parameters.Current.DeDriftEnable
+                    TempPreprocessed = TempPreprocessed - smoothdata(TempPreprocessed,'gaussian',obj.Parameters.Current.DeDriftKernel);
+                end
+
+                % Bandpass filter
                 if obj.Parameters.Current.BPEnable
-                    TempPreprocessed = bandpass(ECGDeDrift,[obj.Parameters.Current.BPLow obj.Parameters.Current.BPHigh],obj.RawFrequency);
-                else
-                    TempPreprocessed = ECGDeDrift;
+                   TempPreprocessed = bandpass(TempPreprocessed,[obj.Parameters.Current.BPLow obj.Parameters.Current.BPHigh],obj.Frequency);
                 end
 
                 % Notch filter
                 if obj.Parameters.Current.NotchFilter
-                    TempPreprocessed = bandstop(TempPreprocessed,obj.PowerGrid+[-5 5],obj.RawFrequency,'ImpulseResponse','iir');
+                    TempPreprocessed = bandstop(TempPreprocessed,obj.PowerGrid+[-5 5],obj.Frequency,'ImpulseResponse','iir');
                 end
-                
+
                 if obj.Parameters.Current.BeatPeaksFilter
                     TempRawValues = smoothdata(TempPreprocessed,'sgolay');
                 else
                     TempRawValues = TempPreprocessed;
                 end
+                % Convert back into samples
                 BeatPeaksIndex_S = round(BeatPeaks*obj.RawFrequency - obj.Parameters.Current.Frag * obj.RawFrequency);
-                tic
+                
                 Range = ceil(1+obj.RawFrequency/obj.Frequency);
                 BeatPeaksValue = arrayfun(@(x) max(TempRawValues(BeatPeaksIndex_S(x)-Range : BeatPeaksIndex_S(x)+Range)),1:numel(BeatPeaks));
                 BeatPeaksIndex = arrayfun(@(x) find(TempRawValues(BeatPeaksIndex_S(x)-Range : BeatPeaksIndex_S(x)+Range)==BeatPeaksValue(x)),1:numel(BeatPeaks),'UniformOutput',false);
@@ -1726,17 +2078,43 @@ classdef ECG_Process_v2 < handle
                 BeatPeaksTimes = BeatPeaks;
             end
 
-            % Perpare heartbeats file
+            % Make sure we have at least one timestamp per excluded 
+            % range to provide a breaking point after processing heart rate
+            AddedBeat = [];
+            if ~isempty(obj.RemovedWindows)
+                for R = 1 : size(obj.RemovedWindows,1)
+                    RemoveIndx = BeatPeaksTimes>=obj.RemovedWindows(R,1) & BeatPeaksTimes <= (obj.RemovedWindows(R,2));
+                    if ~any(RemoveIndx)
+                        AddedBeat = [AddedBeat,mean(obj.RemovedWindows(R,:))];
+                    end
+                end
+            end
+            if ~isempty(obj.Artefacts)
+                for R = 1 : size(obj.Artefacts,1)
+                    RemoveIndx = BeatPeaksTimes>=obj.Artefacts(R,1) & BeatPeaksTimes <= (obj.Artefacts(R,2));
+                    if  ~any(RemoveIndx)
+                        AddedBeat = [AddedBeat,mean(obj.Artefacts(R,:))];
+                    end
+                end
+            end
+            BeatPeaksTimes = sort([BeatPeaksTimes,AddedBeat]);
+
+            % Perpare and save .mat heart beats file
             SavedHeartBeats.BeatPeaks = BeatPeaksTimes;
             SavedHeartBeats.HeartBeats = obj.HeartBeats;
             SavedHeartBeats.Artefacts = obj.Artefacts;
             SavedHeartBeats.RemovedWindows = obj.RemovedWindows;
+            SavedHeartBeats.GUIver = obj.CurrVer;
             save(obj.HeartBeatsFile,'-Struct','SavedHeartBeats');
+
             % Logfile
-            CurrLog = {datetime,getenv('username')};
+            CurrLog = {datetime,getenv('username'),obj.CurrVer};
             if exist(obj.LogFile,'file')
                 Log = load(obj.LogFile);
                 if isfield(Log,'Log')
+                    if size(Log.Log,2) ~= 3
+                        Log.Log = [Log.Log,cell(size(Log.Log,1),3-size(Log.Log,2))];
+                    end
                     Log.Log = [Log.Log; CurrLog];
                 else
                     Log.Log = [CurrLog]; % Legacy
@@ -1746,8 +2124,36 @@ classdef ECG_Process_v2 < handle
             end
             Log.Parameters = obj.Parameters;
             Log.Files.RawECG_File = obj.RawFile;
-            Log.Files.RawECG_FileType = obj.RawFile;
+            Log.Files.RawECG_FileType = obj.Ext;
             save(obj.LogFile,'-Struct','Log');
+
+            % Export as .csvs if requested
+            if obj.Parameters.Current.ExportCSVHeartbeats
+                Data_CSV = BeatPeaksTimes;
+                % Set NaN values for the ranges to exclude (not based on
+                % window-size), to make sure no false beat goes through
+                if ~isempty(obj.RemovedWindows)
+                    for R = 1 : size(obj.RemovedWindows,1)
+                        RemoveIndx = Data_CSV>=obj.RemovedWindows(R,1) & Data_CSV <= (obj.RemovedWindows(R,2));
+                        Data_CSV(RemoveIndx) = NaN;
+                    end
+                end
+                if ~isempty(obj.Artefacts)
+                    for R = 1 : size(obj.Artefacts,1)
+                        RemoveIndx = Data_CSV>=obj.Artefacts(R,1) & Data_CSV <= (obj.Artefacts(R,2));
+                        Data_CSV(RemoveIndx) = NaN;
+                    end
+                end
+                CSV_File = [obj.Path filesep obj.Basename '_HeartBeats.csv'];
+                writematrix(Data_CSV',CSV_File)
+            end
+            if obj.Parameters.Current.ExportCSVHR
+                % Process HR with the dedicated function to clean from the
+                % artefacts/excluded ranges
+                Data_CSV = GetHeartRate(obj.HeartBeatsFile,'WindowSize',obj.Parameters.Current.SlidingWindowSize);
+                CSV_File = [obj.Path filesep obj.Basename '_HeartRate.csv'];
+                writematrix(Data_CSV,CSV_File)
+            end
             obj.EnableAll;
         end
 
@@ -1823,17 +2229,18 @@ classdef ECG_Process_v2 < handle
             [~,IndexPoint] = min(abs(Clicked(1) - obj.Peaks));
             ClickedPeak = obj.Peaks(IndexPoint);
             % Check if selected or not
-            if any(obj.HeartBeats==ClickedPeak)
-                IndxD = obj.HeartBeats==ClickedPeak;
+            Comm = obj.Intersect(ClickedPeak,obj.HeartBeats);
+            if any(Comm)
+                IndxD = Comm;
                 obj.Handles.MarkersBeats.XData(IndxD) = [];
                 obj.Handles.MarkersBeats.YData(IndxD) = [];
+                obj.HeartBeats(IndxD) = [];
                 if obj.Parameters.Current.ShapesEnable
-                    obj.Handles.ShapesBeats(IndexPoint).Color = [0.8 0.8 0.8];
+                    obj.PlotBeatShapes;
                 end
                 if obj.Parameters.Current.BeatPeaksEnable
-                    obj.Handles.BeatPeaks(IndexPoint).Color = 'none';
+                    obj.PlotBeatPeaks;
                 end
-                obj.HeartBeats(IndxD) = [];
                 if obj.Parameters.Current.AutoUpdate
                     obj.DisableAll;
                     obj.ProcessHeartRate;
@@ -1843,10 +2250,10 @@ classdef ECG_Process_v2 < handle
                 obj.Handles.MarkersBeats.XData = sort([obj.Handles.MarkersBeats.XData,ClickedPeak]);
                 obj.Handles.MarkersBeats.YData = [obj.Handles.MarkersBeats.YData,0];
                 if obj.Parameters.Current.ShapesEnable
-                    obj.Handles.ShapesBeats(IndexPoint).Color = obj.Colors(2,:);
+                    obj.PlotBeatShapes;
                 end
                 if obj.Parameters.Current.BeatPeaksEnable
-                    obj.Handles.BeatPeaks(IndexPoint).Color = 'k';
+                    obj.PlotBeatPeaks;
                 end
                 if obj.Parameters.Current.AutoUpdate
                     obj.DisableAll;
@@ -1919,6 +2326,10 @@ classdef ECG_Process_v2 < handle
                 obj.Handles.FillWindowRemoved.(Subs{S}) = arrayfun(@(x) fill([0 obj.Parameters.Current.SlidingWindowSize obj.Parameters.Current.SlidingWindowSize 0]+obj.RemovedWindows(x,2), [ obj.Handles.Min.(Subs{S})  obj.Handles.Min.(Subs{S})  obj.Handles.Max.(Subs{S})  obj.Handles.Max.(Subs{S})],[0.85 0.85 0.9],'EdgeColor',[0.85 0.85 0.9],'FaceColor','none','LineStyle',':','LineWidth',2,'Parent',obj.Axes.(Subs{S})),1:size(obj.RemovedWindows,1));
                 uistack( obj.Handles.FillWindowRemoved.(Subs{S}),'bottom')
             end
+            if obj.Parameters.Current.AutoUpdate
+                obj.DisableAll;
+                obj.ProcessHeartRate;
+            end
         end
 
         function SelectWindow(obj,src,~)
@@ -1954,8 +2365,12 @@ classdef ECG_Process_v2 < handle
                     obj.Handles.FillRemovedWindows.(Subs{S}) = arrayfun(@(x) fill([obj.RemovedWindows(x,1) obj.RemovedWindows(x,2) obj.RemovedWindows(x,2) obj.RemovedWindows(x,1)], [ obj.Handles.Min.(Subs{S})  obj.Handles.Min.(Subs{S})  obj.Handles.Max.(Subs{S})  obj.Handles.Max.(Subs{S})],[0.85 0.85 0.9],'EdgeColor','none','Parent',obj.Axes.(Subs{S}),'ButtonDownFcn',@(src,evt)obj.SelectWindow(src,evt),'Tag',num2str(x)),1:size(obj.RemovedWindows,1));
                     uistack(obj.Handles.FillRemovedWindows.(Subs{S}),'bottom')
                     delete(obj.Handles.FillWindowRemoved.(Subs{S}))
-                    obj.Handles.FillWindowRemoved.(Subs{S}) = arrayfun(@(x) fill([0 obj.Parameters.Current.SlidingWindowSize obj.Parameters.Current.SlidingWindowSize 0]+obj.RemovedWindows(x,2), [Min Min Max Max],[0.75 0.75 0.75],'EdgeColor',[0.75 0.75 0.75],'FaceColor','none','LineStyle','--','LineWidth',1,'Parent',obj.Axes.(Subs{S})),1:size(obj.RemovedWindows,1));
+                    obj.Handles.FillWindowRemoved.(Subs{S}) = arrayfun(@(x) fill([0 obj.Parameters.Current.SlidingWindowSize obj.Parameters.Current.SlidingWindowSize 0]+obj.RemovedWindows(x,2), [ obj.Handles.Min.(Subs{S})  obj.Handles.Min.(Subs{S})  obj.Handles.Max.(Subs{S})  obj.Handles.Max.(Subs{S})],[0.75 0.75 0.75],'EdgeColor',[0.75 0.75 0.75],'FaceColor','none','LineStyle','--','LineWidth',1,'Parent',obj.Axes.(Subs{S})),1:size(obj.RemovedWindows,1));
                     uistack( obj.Handles.FillWindowRemoved.(Subs{S}),'bottom')
+                end
+                if obj.Parameters.Current.AutoUpdate
+                    obj.DisableAll;
+                    obj.ProcessHeartRate;
                 end
             end
             obj.Selected = [];
@@ -2049,6 +2464,10 @@ classdef ECG_Process_v2 < handle
                     if obj.Parameters.Current.DeDriftKernel ~= obj.Previous.DeDriftKernel
                         Reprocess = true;
                     end
+                    % Inverse ECG
+                    if obj.Parameters.Current.InverseECG ~= obj.Previous.InverseECG
+                        Reprocess = true;
+                    end
                 else
                     Reprocess = true;
                 end
@@ -2074,8 +2493,14 @@ classdef ECG_Process_v2 < handle
                     ECG_Raw = obj.RawValues;
                     obj.Frequency = obj.RawFrequency;
                 end
+                obj.Times = round(obj.Times,6);
+                obj.Preprocessed = ECG_Raw-nanmean(ECG_Raw);
 
-                obj.Preprocessed = ECG_Raw;
+                % Flipping signal
+                if obj.Parameters.Current.InverseECG
+                    obj.Preprocessed = -obj.Preprocessed;
+                end
+
                 % Remove drift by using sliding average
                 if obj.Parameters.Current.DeDriftEnable
                     obj.Preprocessed = obj.Preprocessed - smoothdata(obj.Preprocessed,'gaussian',obj.Parameters.Current.DeDriftKernel);
@@ -2095,7 +2520,7 @@ classdef ECG_Process_v2 < handle
                 Art = [];
                 if obj.Parameters.Current.AutoArtefactsRemoval
                     % Elevate
-                    SqECG = smoothdata(abs(obj.Preprocessed).^obj.Parameters.Current.Power,'gaussian',16);
+                    SqECG = smoothdata(abs(obj.Preprocessed).^obj.Parameters.Current.Power,'gaussian',obj.Parameters.Current.ArtefactsDetectSmoothing);
                     SqECG2 = SqECG.^2;
 
                     % Get peaks (automatic detection)
@@ -2201,13 +2626,27 @@ classdef ECG_Process_v2 < handle
                 % Make sure interactions are disabled during processing
                 obj.DisableAll;
 
+
+                if obj.ReloadMode && obj.LegacyMode
+                    % Legacy
+                    % Some old extractions have different
+                    % precision/timestamps, leading to mismatch between
+                    % loaded heart beats and detected "overall" peaks:
+                    % We need to fetch the corresponding index and merge,
+                    % as well as "fix" the heartbeats themselves
+                    LegacyPeaks = knnsearch(obj.Times',obj.HeartBeats');
+                    obj.HeartBeats = obj.Times(LegacyPeaks);
+                else
+                    LegacyPeaks = [];
+                end
+
                 % Transform values to get the beats more separate from the noise
                 SqECG = smoothdata(abs(obj.Preprocessed).^obj.Parameters.Current.Power,'gaussian',4*obj.Parameters.Current.SmoothDetection);
                 SqECG2 = SqECG.^2;
 
                 % Get peaks (automatic detection)
                 [~,Index,~,Height] = findpeaks(SqECG2);
-                PeaksIndex = Index(Height>obj.Parameters.Current.Threshold);
+                PeaksIndex = unique([Index(Height>obj.Parameters.Current.Threshold);LegacyPeaks]);
                 SamplesRange = obj.Parameters.Current.WaveformWindowLow:obj.Parameters.Current.WaveformWindowHigh;
                 Index_Perc = Height>prctile(Height,70) & Height<prctile(Height,90);
                 IndexTemplates = Index(Index_Perc);
@@ -2226,7 +2665,7 @@ classdef ECG_Process_v2 < handle
                         obj.Parameters.Current.Threshold = prctile(HeightOr,0.2);
                         obj.Handles.Threshold.Edit.String = num2str(obj.Parameters.Current.Threshold,3);
                         [~,Index,~,Height] = findpeaks(SqECG2);
-                        PeaksIndex = Index(Height>obj.Parameters.Current.Threshold);
+                        PeaksIndex = unique([Index(Height>obj.Parameters.Current.Threshold),LegacyPeaks]);
                         SamplesRange = obj.Parameters.Current.WaveformWindowLow:obj.Parameters.Current.WaveformWindowHigh;
                         Index_Perc = Height>prctile(Height,70) & Height<prctile(Height,90);
                         IndexTemplates = Index(Index_Perc);
@@ -2241,19 +2680,37 @@ classdef ECG_Process_v2 < handle
                     end
                 end
                
+
                 % Extract the waveforms
                 obj.RangeShapes = repmat(PeaksIndex,1,numel(SamplesRange)) + SamplesRange;
                 obj.Shapes = obj.Preprocessed(obj.RangeShapes);
-                obj.Peaks = obj.Times(PeaksIndex);
+                if isscalar(PeaksIndex)
+                    obj.RangeShapes = obj.RangeShapes';
+                    obj.Shapes =  obj.Shapes';
+                end
+                obj.Peaks = round(obj.Times(PeaksIndex),6);
                 XcorrAll = (arrayfun(@(x) nanmax(xcorr(obj.Template,zscore(obj.Shapes(x,:),1,2))),1:numel(obj.Shapes(:,1))));
                 obj.MaxCorr = nanmax(XcorrAll);
 
                 % Get RPeak position in template
                 [~,RPeak_Template] = nanmax(obj.Template);
+                while RPeak_Template<=obj.Parameters.Current.PeakRange
+                    obj.Parameters.Current.PeakRange = obj.Parameters.Current.PeakRange-1;
+                end
 
                 % Get positions for each peak
                 % (look for the maximum around estimated location)
-                BeatPeaksValue = arrayfun(@(x) nanmax(obj.Shapes(x,RPeak_Template-obj.Parameters.Current.PeakRange:RPeak_Template+obj.Parameters.Current.PeakRange)),1:size(obj.Shapes,1));
+                if RPeak_Template+obj.Parameters.Current.PeakRange>size(obj.Shapes,2)
+                    CPRe = size(obj.Shapes,2);
+                else
+                    CPRe = RPeak_Template+obj.Parameters.Current.PeakRange;
+                end
+                if RPeak_Template-obj.Parameters.Current.PeakRange<1
+                    CPRs = 1;
+                else
+                    CPRs = RPeak_Template-obj.Parameters.Current.PeakRange;
+                end
+                BeatPeaksValue = arrayfun(@(x) nanmax(obj.Shapes(x,CPRs:CPRe)),1:size(obj.Shapes,1));                
                 % If the threshold is low we can pick a range with NaN in
                 % the peak range
                 NaNIndx = isnan(BeatPeaksValue);
@@ -2264,7 +2721,7 @@ classdef ECG_Process_v2 < handle
                     obj.Shapes(NaNIndx,:) = [];
                     obj.Peaks(NaNIndx) = [];
                 end
-                BeatPeaksIndex = arrayfun(@(x) find(obj.Shapes(x,RPeak_Template-obj.Parameters.Current.PeakRange:RPeak_Template+obj.Parameters.Current.PeakRange)==BeatPeaksValue(x)),1:size(obj.Shapes,1),'UniformOutput',false);
+                BeatPeaksIndex = arrayfun(@(x) find(obj.Shapes(x,CPRs:CPRe)==BeatPeaksValue(x)),1:size(obj.Shapes,1),'UniformOutput',false);
                 % Check if we have ties...
                 IndxMultiple = find(arrayfun(@(x) numel(BeatPeaksIndex{x})>1,1:numel(BeatPeaksIndex)));
                 if ~isempty(IndxMultiple)
@@ -2276,9 +2733,10 @@ classdef ECG_Process_v2 < handle
                 BeatPeaksIndex = cell2mat(BeatPeaksIndex)+ obj.Parameters.Current.WaveformWindowLow + RPeak_Template - obj.Parameters.Current.PeakRange - 2;
                 BeatPeaksTimes = obj.Times(PeaksIndex+BeatPeaksIndex');
                 obj.BeatPeaks = [BeatPeaksTimes',BeatPeaksValue'];
+                
                 % If we are loading a previous file...
                 if ~obj.ReloadMode
-                    obj.HeartBeats = obj.Peaks; % For initialization
+                    obj.HeartBeats = round(obj.Peaks,6); % For initialization
                 end
 
                 delete(obj.Axes.Elevated.Children)
@@ -2327,27 +2785,15 @@ classdef ECG_Process_v2 < handle
                 obj.Handles.Max.SubPeaks = Max;
 
                 if obj.Parameters.Current.ShapesEnable
-                    % Instead of plotting individual waveforms, we'll just
-                    % overlay full ECG traces again, with NaN ranges 
-                    % (much faster/efficient even when navigating
-                    % afterwards)
-                    [~,~,Indx] = intersect(obj.HeartBeats,obj.Peaks);
-                    [~,Indx2] = setdiff(obj.Peaks,obj.HeartBeats);
-                    TempSignal1 = NaN(size(obj.Preprocessed));
-                    TempSignal2 = NaN(size(obj.Preprocessed));
-                    FullIndx1 = obj.RangeShapes(Indx,:);
-                    FullIndx1 = sort(FullIndx1(:));
-                    FullIndx2 = obj.RangeShapes(Indx2,:);
-                    FullIndx2 = sort(FullIndx2(:));
-                    TempSignal1(FullIndx1) = obj.Preprocessed(FullIndx1);
-                    TempSignal2(FullIndx2) = obj.Preprocessed(FullIndx2);
-                    obj.Handles.ShapesBeats = [plot(obj.Times, TempSignal2,'Color',[0.8 0.8 0.8],'LineWidth',1.5,'Parent',obj.Axes.SubPeaks);
-                        plot(obj.Times, TempSignal1,'Color',obj.Colors(2,:),'LineWidth',1.5,'Parent',obj.Axes.SubPeaks)];
+                   obj.PlotBeatShapes;
+                else
+                    obj.Handles.ShapesBeats = [];
                 end
 
                 if obj.Parameters.Current.BeatPeaksEnable
-                    [~,~,Indx] = intersect(obj.HeartBeats,obj.Peaks);
-                    obj.Handles.BeatPeaks = plot((obj.BeatPeaks(Indx,1))', (obj.BeatPeaks(Indx,2))','o','Color','k','MarkerSize',10,'LineWidth',1.5,'Parent',obj.Axes.SubPeaks);
+                    obj.PlotBeatPeaks;
+                else
+                    obj.Handles.BeatPeaks = [];
                 end
 
                 if ~isempty(obj.Artefacts)
@@ -2390,7 +2836,7 @@ classdef ECG_Process_v2 < handle
             obj.DisableAll;
 
             % Use a slinding mean to obtain heart rate
-            [TempHeartBeats,TempHeartRate] = SlidingMean_v2(obj.HeartBeats,obj.Parameters.Current.SlidingWindowSize,'SharpBreaks',false);
+            [TempHeartBeats,TempHeartRate] = SlidingMean(obj.HeartBeats,obj.Parameters.Current.SlidingWindowSize,'SharpBreaks',false);
             if ~isempty(obj.RemovedWindows)
                 for R = 1 : size(obj.RemovedWindows,1)
                     RemoveIndx = TempHeartBeats>=obj.RemovedWindows(R,1) & TempHeartBeats <= (obj.RemovedWindows(R,2)+obj.Parameters.Current.SlidingWindowSize);
@@ -2557,7 +3003,7 @@ classdef ECG_Process_v2 < handle
                 % overlay full ECG traces again, with NaN ranges
                 % (much faster/efficient even when navigating
                 % afterwards)
-                [~,~,Indx] = intersect(obj.HeartBeats,obj.Peaks);
+                Indx = obj.Intersect(obj.HeartBeats,obj.Peaks);
                 [~,Indx2] = setdiff(obj.Peaks,obj.HeartBeats);
                 TempSignal1 = NaN(size(obj.Preprocessed));
                 TempSignal2 = NaN(size(obj.Preprocessed));
@@ -2574,11 +3020,15 @@ classdef ECG_Process_v2 < handle
                 delete(obj.Handles.MarkersAll)
                 obj.Handles.MarkersAll = plot(obj.Peaks,zeros(size(obj.Peaks)),'d','Color',[0.6 0.6 0.6],'MarkerEdgeColor','k','ButtonDownFcn',@(~,~)obj.SelectBeat,'Parent',obj.Axes.SubPeaks,'MarkerSize',12,'MarkerFaceColor',[0.6 0.6 0.6]);
                 obj.Handles.MarkersBeats = plot(obj.HeartBeats,zeros(size(obj.HeartBeats)),'d','Color',obj.Colors(3,:),'MarkerEdgeColor','k','ButtonDownFcn',@(~,~)obj.SelectBeat,'Parent',obj.Axes.SubPeaks,'MarkerSize',12,'MarkerFaceColor',obj.Colors(3,:));
+            else
+                obj.Handles.ShapesBeats = [];
             end
             if obj.Parameters.Current.BeatPeaksEnable
-                [~,~,Indx] = intersect(obj.HeartBeats,obj.Peaks);
+                Indx = obj.Intersect(obj.HeartBeats,obj.Peaks);
                 delete(obj.Handles.BeatPeaks)                    
                 obj.Handles.BeatPeaks = plot((obj.BeatPeaks(Indx,1))', (obj.BeatPeaks(Indx,2))','o','Color','k','MarkerSize',10,'LineWidth',1.5,'Parent',obj.Axes.SubPeaks);
+            else
+                obj.Handles.BeatPeaks = [];
             end
             if ~isempty(obj.HeartBeats)
                 obj.ProcessHeartRate;
@@ -2934,6 +3384,38 @@ classdef ECG_Process_v2 < handle
                 end
                 RangeInfo(end,:) = [IndexDiff(end)+1,numel(IndexIn), numel(IndexIn) - IndexDiff(end)];
             end
+        end
+        function Vector = InterpNaN(Vector,MaxRange)
+            Indices = 1 : numel(Vector);
+            NaNIndex = isnan(Vector);
+            % Check that we don't have large ranges - otherwise raise an
+            % error
+            RangesInfo = FindContinuousRange(find(NaNIndex));
+            if any(RangesInfo(:,3)>MaxRange)
+                warndlg(['Some NaN ranges exceed the defined length that' ...
+                    ' was defined as ''safe''. Make sure the resulting' ...
+                    ' signal is valid.'],'WARNING')
+            end
+            Vector(NaNIndex) = interp1(Indices(~NaNIndex), Vector(~NaNIndex), Indices(NaNIndex), 'linear');
+
+        end
+        function isEqual = Intersect(ArrayA,ArrayB)
+            if ~(isvector(ArrayA) && isvector(ArrayB))
+                error('Arrays must be vectors.')
+            end
+            if size(ArrayA,1)~=size(ArrayB,1)
+                ArrayA = ArrayA';
+            end
+             [~,~,isEqual] = intersect(round(ArrayA,6),round(ArrayB,6));
+        end
+        function  DC = DefColors
+            DC = [0.00,0.45,0.74;
+                0.85,0.33,0.10;
+                0.93,0.69,0.13;
+                0.49,0.18,0.56;
+                0.47,0.67,0.19;
+                0.30,0.75,0.93;
+                0.64,0.08,0.18];
         end
     end
 end
